@@ -15,6 +15,7 @@ import time
 import subprocess
 import re
 from pathlib import Path
+import base64
 
 import serial
 import serial.tools.list_ports
@@ -26,7 +27,7 @@ CONFIG_RPI_USER = "bella"
 CONFIG_RPI_PASS = "bella"
 CONFIG_AP_SSID  = "Bella-RF-Test"
 CONFIG_AP_COUNTRY = "GB"   # adjust if needed
-CONFIG_AP_SUBNET = None  # .1 used by RPi AP, DHCP .10-.200
+CONFIG_AP_SUBNET = "10.0.2"  # .1 used by RPi AP, DHCP .10-.200
 
 PROMPT = r'[@~]# |[@~]\$ '
 READ_TIMEOUT = 2.0
@@ -34,11 +35,12 @@ LONG_TIMEOUT = 20.0
 
 # ---------- Serial helpers ----------
 class SerialShell:
-    def __init__(self, port, baud=115200, user=None, password=None, login_timeout=20):
+    def __init__(self, port, baud=115200, user=None, password=None, login_timeout=20, verbose=False):
         self.ser = serial.Serial(port=port, baudrate=baud, timeout=0.2)
         self.user = user
         self.password = password
         self.login_timeout = login_timeout
+        self.verbose = verbose
 
     def close(self):
         try:
@@ -88,7 +90,13 @@ class SerialShell:
 
     def run(self, cmd, timeout=LONG_TIMEOUT, check=True):
         marker = "__CMD_DONE__"
-        wrapped = f"{cmd}; EC=$?; echo {marker}$EC"
+        # Handle multi-line commands by joining them with && and adding the marker
+        if '\n' in cmd:
+            # For multi-line commands, join with && and add the marker at the end
+            lines = [line.strip() for line in cmd.strip().split('\n') if line.strip()]
+            wrapped = ' && '.join(lines) + f"; EC=$?; echo {marker}$EC"
+        else:
+            wrapped = f"{cmd}; EC=$?; echo {marker}$EC"
         self._write_line(wrapped)
         out = b""
         end = time.time() + timeout
@@ -103,6 +111,16 @@ class SerialShell:
         txt = out.decode(errors="ignore")
         m = re.search(rf"{marker}(\-?\d+)", txt)
         rc = int(m.group(1)) if m else 0
+        
+        # Print command output if verbose mode is enabled
+        if self.verbose:
+            # Remove the marker line from output for cleaner display
+            clean_output = re.sub(rf"{marker}\-?\d+\s*$", "", txt, flags=re.MULTILINE).strip()
+            if clean_output:
+                print(f"[rpi] $ {cmd}")
+                print(clean_output)
+                print("---")
+        
         if check and rc != 0:
             raise RuntimeError(f"Remote command failed (rc={rc}): {cmd}\n---\n{txt}\n---")
         return txt, rc
@@ -230,6 +248,12 @@ def get_rpi_ip(sh: SerialShell):
     # If no IP found, raise error
     raise SystemExit("No active WiFi or Ethernet IP found on RPI. Check network connectivity and retry.")
 
+TEST_SNIPPET = r"""
+set -e
+cd /home/bella
+touch hello.txt
+"""
+
 # ---------- Remote (RPi) provisioning (no wl) ----------
 INSTALL_SNIPPET = r"""
 set -e
@@ -276,32 +300,32 @@ while True:
 # ---------- RPi state init/reset (safe to run anytime) ----------
 RESET_SNIPPET = r"""
 set -e
-# 1) 중복 떠있는 프로세스 종료
+# 1) Kill duplicate running processes
 sudo pkill hostapd || true
 sudo pkill dnsmasq || true
 sudo pkill iperf3 || true
 sudo pkill -f link_monitor.py || true
 sudo pkill -f l2ping || true
 
-# 2) Wi-Fi 인터페이스 정리
+# 2) Clean up Wi-Fi interface
 IFACE=$(iw dev | awk '/Interface/ {print $2; exit}')
 if [ -z "$IFACE" ]; then IFACE=wlan0; fi
 sudo rfkill unblock all || true
 sudo ip addr flush dev $IFACE || true
 sudo ip link set $IFACE down || true
 
-# wpa_supplicant 정리 (실험 중에는 우리가 올리는 AP가 우선)
+# Clean up wpa_supplicant (our AP takes precedence during experiments)
 sudo pkill wpa_supplicant || true
 
-# 3) BLE/BT 정리
-# BLE 테스트가 살아있다면 종료 시도
+# 3) Clean up BLE/BT
+# If BLE test is running, try to end it
 sudo btmgmt -i hci0 le-test-end >/dev/null 2>&1 || true
-# HCI 리셋
+# HCI reset
 sudo hciconfig hci0 down || true
 sudo hciconfig hci0 up || true
 
-# 4) 기본 네트워킹 서비스는 건드리지 않음 (dhcpcd 등)
-# 필요 시 재부팅 없이 다음 시나리오가 바로 동작 가능한 깨끗한 상태로 만든다.
+# 4) Do not touch basic networking services (dhcpcd, etc.)
+# This ensures a clean state for the next scenario to run immediately without reboot if needed.
 """
 
 def init_rpi_state(sh: SerialShell):
@@ -309,8 +333,8 @@ def init_rpi_state(sh: SerialShell):
     sh.run(RESET_SNIPPET, timeout=30, check=False)
 
 def push_link_monitor(sh: SerialShell):
-    sh.run("mkdir -p /opt/rf-tests/emc")
-    sh.run("cat > /opt/rf-tests/emc/link_monitor.py <<'PY'\n" + LINK_MONITOR_PY + "\nPY\nchmod +x /opt/rf-tests/emc/link_monitor.py")
+    sh.run("sudo mkdir -p /opt/rf-tests/emc")
+    sh.run("sudo cat > /opt/rf-tests/emc/link_monitor.py <<'PY'\n" + LINK_MONITOR_PY + "\nPY\nchmod +x /opt/rf-tests/emc/link_monitor.py")
 
 # ---------- Hostapd/DHCP ephemeral bring-up ----------
 def start_ap(sh: SerialShell, band="2g", channel="1", ssid=CONFIG_AP_SSID, country=CONFIG_AP_COUNTRY):
@@ -328,8 +352,14 @@ def start_ap(sh: SerialShell, band="2g", channel="1", ssid=CONFIG_AP_SSID, count
         ht_cap = "ieee80211n=1\nieee80211ac=1\nwmm_enabled=1\n"
         ch_line = f"channel={channel}"
 
-    hostapd_conf = f"""
-interface=$(cat /opt/rf-tests/.wifi_if 2>/dev/null || echo wlan0)
+    # Explanation:
+    # When running 'cat > file <<EOF ... EOF' over a serial shell, the here-document
+    # is not interpreted by the remote shell as expected, because the command is sent
+    # as a single line and the shell does not see the following lines as input.
+    # Instead, use 'echo' with proper escaping, or use 'printf' to write the config files.
+
+    # Write hostapd.conf using printf for reliability over serial
+    hostapd_conf = f"""interface=$(cat /opt/rf-tests/.wifi_if 2>/dev/null || echo wlan0)
 driver=nl80211
 ssid={ssid}
 country_code={country}
@@ -340,19 +370,23 @@ ignore_broadcast_ssid=0
 wpa=0
 {ht_cap}
 """
-    sh.run("cat > /tmp/hostapd.conf <<'H'\n" + hostapd_conf + "\nH")
+    # Escape single quotes for safe shell usage
+    hostapd_conf_escaped = hostapd_conf.replace("'", "'\"'\"'")
+    sh.run(f"printf '%s' '{hostapd_conf_escaped}' | sudo tee /tmp/hostapd.conf > /dev/null")
 
     sh.run("IFACE=$(cat /opt/rf-tests/.wifi_if 2>/dev/null || echo wlan0); "
            f"sudo ip link set $IFACE up; "
            f"sudo ip addr add {CONFIG_AP_SUBNET}.1/24 dev $IFACE || true")
 
-    sh.run("cat > /tmp/dnsmasq.conf <<'D'\n"
-           "interface=$(cat /opt/rf-tests/.wifi_if 2>/dev/null || echo wlan0)\n"
-           "bind-interfaces\n"
-           f"dhcp-range={CONFIG_AP_SUBNET}.10,{CONFIG_AP_SUBNET}.200,12h\n"
-           "D\n")
-    sh.run("sudo dnsmasq --conf-file=/tmp/dnsmasq.conf", timeout=5)
-    sh.run("sudo hostapd -B /tmp/hostapd.conf", timeout=5)
+    # Write dnsmasq.conf using a different approach to ensure file creation
+    # Use echo for each line to append, which is more robust over serial
+    sh.run("sudo rm -f /tmp/dnsmasq.conf")
+    sh.run("echo 'interface=$(cat /opt/rf-tests/.wifi_if 2>/dev/null || echo wlan0)' | sudo tee -a /tmp/dnsmasq.conf > /dev/null")
+    sh.run("echo 'bind-interfaces' | sudo tee -a /tmp/dnsmasq.conf > /dev/null")
+    sh.run(f"echo 'dhcp-range={CONFIG_AP_SUBNET}.10,{CONFIG_AP_SUBNET}.200,12h' | sudo tee -a /tmp/dnsmasq.conf > /dev/null")
+
+    sh.run("sudo dnsmasq --conf-file=/tmp/dnsmasq.conf --no-daemon --port=0 > /tmp/dnsmasq.log 2>&1", timeout=5)
+    # sh.run("sudo hostapd -B /tmp/hostapd.conf > /tmp/hostapd.log 2>&1", timeout=5)
     print("[rpi] AP up. Connect your Mac to SSID:", ssid)
 
 def stop_ap(sh: SerialShell):
@@ -386,21 +420,21 @@ def wifi_tx(sh: SerialShell, band, ch, duration):
     Continuous modulated surrogate: UDP flood RPi->Mac over forced-channel AP.
     Mac IP auto-picked (Wi-Fi preferred).
     """
-    init_rpi_state(sh)
-    start_ap(sh, band=band, channel=ch)
+    # init_rpi_state(sh)
+    # start_ap(sh, band=band, channel=ch)
     ensure_iperf3()
     print(f"[mac] Join the AP SSID '{CONFIG_AP_SSID}' (open).")
     # auto-pick Wi-Fi/Ethernet IP on Mac within AP subnet
     mac_dev, mac_ip = wait_for_mac_ip_on_selected_iface(CONFIG_AP_SUBNET)
     print(f"[auto] Using Mac {mac_dev} IP {mac_ip} for iperf3 server.")
 
-    srv = run_local("iperf3 -s", stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    # srv = run_local("iperf3 -s", stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
         cmd = f"iperf3 -c {mac_ip} -u -b 100M -t {duration}"
         print(f"[rpi] {cmd}")
         sh.run(cmd, timeout=duration+15, check=False)
     finally:
-        srv.terminate()
+        # srv.terminate()
         stop_ap(sh)
 
 def wifi_rx(sh: SerialShell, band, ch, duration):
@@ -416,7 +450,7 @@ def wifi_rx(sh: SerialShell, band, ch, duration):
     print(f"[auto] Mac {mac_dev} IP {mac_ip}")
 
     # RPi: iperf3 server
-    sh.run("pkill iperf3 || true")
+    sh.run("sudo pkill iperf3 || true")
     sh.run("nohup iperf3 -s > /tmp/iperf3_srv.log 2>&1 &")
 
     # Get RPI IP address dynamically
@@ -501,9 +535,11 @@ def main():
     ap.add_argument("--baud", type=int, default=115200)
     ap.add_argument("--user", help=f"RPi username (default from script: {CONFIG_RPI_USER})")
     ap.add_argument("--password", help=f"RPi password (default from script)")
+    ap.add_argument("--verbose", action="store_true", help="Print command outputs from Raspberry Pi")
 
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("setup", help="Install prereqs on RPi (hostapd,dnsmasq,iperf3,bluez,iw)")
+    sub.add_parser("test", help="Run test on RPi")
     sub.add_parser("recover", help="Initialize/clean RPi state (kill leftover hostapd/dnsmasq/iperf3/BLE tests, flush Wi-Fi iface)")
 
     p_tx24 = sub.add_parser("wifi_tx_24", help="2.4GHz TX (RPi->Mac). UDP flood with forced channel AP")
@@ -546,7 +582,7 @@ def main():
     user = args.user if args.user else CONFIG_RPI_USER
     password = args.password if args.password else CONFIG_RPI_PASS
 
-    sh = SerialShell(port=port, baud=args.baud, user=user, password=password)
+    sh = SerialShell(port=port, baud=args.baud, user=user, password=password, verbose=args.verbose)
     try:
         sh.login()
 
@@ -555,6 +591,15 @@ def main():
             sh.run(INSTALL_SNIPPET, timeout=240)
             push_link_monitor(sh)
             print("[rpi] Setup done.")
+            
+        elif args.cmd == "test":
+            b64 = base64.b64encode(INSTALL_SNIPPET.encode()).decode()
+            # escape single quotes inside INSTALL_SNIPPET
+            # snippet_escaped = INSTALL_SNIPPET.replace("'", "'\"'\"'")
+            # sh.run(f"printf '%s\n' '{snippet_escaped}' | sudo tee /tmp/install_rf.sh > /dev/null")
+            sh.run(f"echo {b64} | base64 -d | sudo tee /tmp/install_rf.sh > /dev/null")
+            sh.run("sudo bash /tmp/install_rf.sh", timeout=240)
+            # sh.run(INSTALL_SNIPPET, timeout=240)
             
         elif args.cmd == "recover":
             init_rpi_state(sh)

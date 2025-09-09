@@ -50,7 +50,7 @@ A Python-based automation script for RF certification testing on Raspberry Pi 4,
    ```bash
    brew install iperf3
    ```
-   
+
 3. **Verify USB Serial Access**
    ```bash
    ls /dev/cu.*
@@ -90,6 +90,29 @@ Run the following script on Mac
 ```bash
 python script.py setup
 ```
+
+### Bluetooth pairing
+
+#### Make RPI discoverable and pairable
+
+```bash
+bluetoothctl
+```
+
+On `bluetoothctl` prompt, do the following.
+```
+[bluetooth]# power on
+[bluetooth]# agent on
+[bluetooth]# default-agent
+[bluetooth]# discoverable on
+[bluetooth]# pairable on
+```
+
+#### Pair with raspeberry pi on Mac
+
+* System Settings -> Bluetooth
+* Pair with Raspberry Pi
+
 
 # Usage Instructions
 
