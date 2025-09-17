@@ -66,3 +66,4 @@ while true; do
   $RFCOMM release 0 2>/dev/null || true
   echo "[BT-TX] Waiting for next connection…"
 done
+

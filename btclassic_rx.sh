@@ -61,3 +61,4 @@ trap 'echo "[INFO] Cleaning up..."; sudo rfcomm release 0 || true; kill $RFC_PID
 
 # Sink bytes forever (shows rate every few seconds if you add status=progress)
 sudo dd if=/dev/rfcomm0 of="$OUT" bs=4096 status=progress
+
